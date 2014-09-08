@@ -1,0 +1,6 @@
+name = RCC Request Tracker Form Handler
+description = "Handle form submissions to the RT system."
+core = 7.x
+package = Research Computing Center Custom
+files[] = rcc_rt_handler.module
+files[] = rcc_rt_handler.install

@@ -1,0 +1,376 @@
+<?php
+require_once 'RequestTracker/CNetIDChecker.inc.php';
+require_once 'RequestTracker/RequestTracker.inc.php';
+require_once 'RequestTracker/RequestTrackerContent.inc.php';
+
+/**
+ * Implements hook_form_alter()
+ * @param $form
+ * @param $form_state
+ * @param $form_id
+ */
+function rcc_rt_handler_form_alter(&$form, &$form_state, $form_id)
+{
+    global $base_root;
+
+    if (isset($form['#node'])) {
+        $node = $form['#node'];
+        // Do we have an RT type form ?
+        if ($node->type == 'rt_form' && isset($node->field_submit_form_to_rt_system)) {
+            // If so, does it go to a queue ?
+            $submitToRT = $node->field_submit_form_to_rt_system['und']['0']['value'] == 1 ? true : false;
+            if ($submitToRT) {
+                $form['#validate'][] = 'rcc_rt_handler_form_validate';
+                $form['actions']['submit']['#submit'][] = 'rcc_rt_handler_form_submit';
+                // Set the environment ( dev, stage , or prod ) so we know if we need to hit the rcc ldap server later.
+                set_rt_env();
+            }
+        }
+    }
+}
+
+/**
+ * Implements hook_form_validate()
+ * @param $form
+ * @param $form_state
+ */
+function rcc_rt_handler_form_validate($form, &$form_state)
+{
+    if (isset($form['#node']) && isset($form_state['values']['submitted'])) {
+        $node = $form['#node'];
+        // Do we have an RT type form.
+        if ($node->type == 'rt_form' && isset($node->field_submit_form_to_rt_system)) {
+            // Validate cnetid.
+            if (isset($form_state['values']['submitted']['cnetid'])) {
+                $cnetid = $form_state['values']['submitted']['cnetid'];
+                if (!$email = CNetIDChecker::check_cnetid($cnetid)) {
+                    form_set_error('title', t("Please enter a valid CNetID."));
+                } elseif (validate_rcc_ldap()) {
+                    if (!CNetIDChecker::check_cnetid_pi($cnetid)) {
+                        form_set_error('title', t("$cnetid does not have an RCC PI Account.  You may submit a request for a PI Account <a href=\"/getting-started/request-account/pi-account-request\">here</a>."));
+                    }
+                }
+            }
+            // Validate start date and end date range , if we have date ranges in the form.
+            $start_date = get_date_object('start', $form_state['values']['submitted']);
+            $end_date = get_date_object('end', $form_state['values']['submitted']);
+            if (!is_null($start_date) && !is_null($end_date)) {
+                if ($end_date < $start_date) {
+                    form_set_error('title', t("Please provide an end date equal to or greater than the start date."));
+                }
+            }
+            // Validate proposal file or proposal text.
+            if (!validate_attachment($form_state)) {
+                if (isset($form_state['values']['submitted']['allocation_proposal'])
+                    && strlen($form_state['values']['submitted']['allocation_proposal']) <= 0
+                ) {
+                    form_set_error('title', t("Please provide proposal text either by uploading a file or entering the text in the space provided."));
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Return date field array as PHP Date Object.
+ * @param $pos
+ * @param array $validation_array
+ * @return DateTime|null
+ */
+function get_date_object($pos, $validation_array = array())
+{
+    $date = null;
+    foreach ($validation_array as $key => $value) {
+        if (is_array($validation_array[$key]) && is_date_field($validation_array[$key])) {
+            $start_pos = strpos($key, $pos);
+            $date_pos = strpos($key, 'date');
+            if ($start_pos && $date_pos) {
+                $date_array = $validation_array[$key];
+                $date = new DateTime($date_array['year'] . '-' . $date_array['month'] . '-' . $date_array['day']);
+            }
+        }
+    }
+    return $date;
+}
+
+/**
+ * Do we have a date field consisting of a
+ * proper date with constituent parts.
+ * @param array $field_array
+ * @return bool
+ */
+function is_date_field($field_array = array())
+{
+    return (isset($field_array['month']) && isset($field_array['day']) && isset($field_array['year']));
+}
+
+/**
+ * Implements hook_form_submit()
+ * @param $form
+ * @param $form_state
+ */
+function rcc_rt_handler_form_submit($form, &$form_state)
+{
+    $rt_url = variable_get('rcc_rt_url');
+    $rt_username = variable_get('rcc_rt_user');
+    $rt_password = variable_get('rcc_rt_password');
+    if (isset($form['#node'])
+        && isset($form_state['values']['submitted'])
+    ) {
+        $node = $form['#node'];
+        if ($node->type == 'rt_form' && isset($node->field_submit_form_to_rt_system)) {
+            // RequestTracker object for REST actions.
+            $RT = new RequestTracker($rt_url, $rt_username, $rt_password);
+            $attachments = get_rt_attachments($form_state);
+            $cnetid = isset($form_state['values']['submitted']['cnetid']) ? $form_state['values']['submitted']['cnetid'] : '';
+            $email = CNetIDChecker::check_cnetid($cnetid);
+            $content_array = get_content_array( $form_state );
+            $queue = $node->field_rt_queue['und'][0]['value'];
+            $queue_props = $RT->getQueueProperties($queue);
+            $queue_description = $queue_props['Description'];
+            $queue_name = $queue_props['Name'];
+            // RequestTrackerContent object to generate ticket content.
+            $TC = new RequestTrackerContent($queue_description, $queue_name, $cnetid, $email, $content_array, $attachments);
+            $response = $RT->createTicket($TC->getTicketContent());
+            $message = "";
+            foreach ($response as $key => $value) {
+                $status = get_response_message($key);
+                if (array_key_exists('ticket_id', $status)) {
+                    $ticket_id = $status['ticket_id'];
+                    $message = $node->field_rt_form_success_message['und']['0']['value'];
+                    if (!empty($attachments)) {
+                        $file_count = 1;
+                        foreach ($attachments as $a) {
+                            $new_file_name = get_new_file_name($cnetid, $ticket_id, $a['uploadpath'], $file_count);
+                            $response2 = $RT->addTicketAttachments($ticket_id, array($new_file_name => $a['uploadpath']));
+                            if (!attachment_success(array_shift(array_keys($response2)))) {
+                                $message .= "<br />There was an error processing your uploaded file.  Please contact help@rcc.uchicago.edu";
+                            }
+                            $file_count++;
+                        }
+                    }
+                }
+            }
+            $message = empty($message) ? "Unknown error creating request. Please contact help@rcc.uchicago.edu" : $message;
+            drupal_set_message(t($message));
+        }
+    }
+
+}
+
+/**
+ * Return HTTP Response message or error message.
+ * @param $message
+ * @return array
+ */
+function get_response_message($message)
+{
+    if (!preg_match("/Ticket (\d+) created/", $message, $matches)) {
+        $status = array('error' => "Unknown error creating Education allocation request.  Please contact help@rcc.uchicago.edu $message");
+    } else {
+        $status = array('ticket_id' => $matches[1]);
+    }
+    return $status;
+}
+
+/**
+ * Return bool HTTP Response message matches success string in HTTP response.
+ * @param $message
+ * @return int
+ */
+function attachment_success($message)
+{
+    return preg_match("/Message recorded/", $message, $matches);
+}
+
+/**
+ * Wrangle field attachment properties array to process for cURL post.
+ * @param $form_state
+ * @return array
+ */
+function get_rt_attachments($form_state)
+{
+    $attachments = array();
+    if (isset($form_state['complete form']['submitted'])) {
+        $submitted = $form_state['complete form']['submitted'];
+        foreach ($submitted as $s) {
+            if (is_array($s) && array_key_exists('#type', $s) && $s['#type'] == 'managed_file') {
+                if (is_object($s['#file'])) {
+                    $file = $s['#file'];
+                    $attachments[] = array(
+                        'filename' => $file->filename,
+                        'uploadpath' => $_SERVER['DOCUMENT_ROOT'] . "/sites/rcc.uchicago.edu/files/webform/rt_form/" . $file->filename
+                    );
+                }
+            }
+        }
+    }
+    return $attachments;
+}
+
+/**
+ * Return bool if we there is a field attachment field empty or not?
+ * @param $form_state
+ * @return bool
+ */
+function validate_attachment($form_state)
+{
+    if (isset($form_state['complete form']['submitted'])) {
+        $submitted = $form_state['complete form']['submitted'];
+        foreach ($submitted as $s) {
+            if (is_array($s) && array_key_exists('#type', $s) && $s['#type'] == 'managed_file') {
+                if (isset($s['#file']) && is_object($s['#file'])) {
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/**
+ * @param $form_state
+ * @return mixed
+ */
+function get_content_array( $form_state ){
+    if (isset($form_state['complete form']['submitted'])) {
+        $submitted = $form_state['complete form']['submitted'];
+        foreach ($submitted as $key => $value ) {
+            if (is_array($value) && array_key_exists('#type', $value) && $value['#type'] == 'managed_file') {
+                if( isset($form_state['values']['submitted'][$key]) ){
+                    unset($form_state['values']['submitted'][$key]);
+                }
+            }
+        }
+    }
+    return $form_state['values']['submitted'];
+}
+/**
+ * @param $cnetid
+ * @param $ticket_id
+ * @param $file_path
+ * @return string
+ */
+function get_new_file_name($cnetid, $ticket_id, $file_path, $file_count)
+{
+    $parts = pathinfo($file_path);
+    $file_name = $cnetid . "_" . $ticket_id . "_" . $file_count . "." . $parts['extension'];
+    return $file_name;
+}
+
+function set_rt_env()
+{
+    global $base_url;
+    $parsed_base_url = parse_url($base_url);
+    $host = explode('.', $parsed_base_url['host']);
+    $_SESSION['rt_env'] = isset($host[0]) ? $host[0] : "";
+}
+
+function validate_rcc_ldap()
+{
+    return (isset($_SESSION['rt_env']) && ($_SESSION['rt_env'] == 'rcc' || $_SESSION['rt_env'] == 'rccstage'));
+}
+
+/**
+ * Adds a menu for setting the user's api_key.
+ *  Implement hook_menu().
+ */
+function rcc_rt_handler_menu() {
+    $items = array();
+
+    $items ['admin/config/rcc_rt_handler'] = array(
+        'title' => 'RT Form Config',
+        'description' => 'Use this section to update credentials for the RT system',
+        'position' => 'left',
+        'weight' => -100,
+        'page_callback' => 'system_admin_menu_block_page',
+        'access arguments' => array('administer site configuration'),
+        'file' => 'system.admin.inc',
+        'file path' => drupal_get_path('module','system'),
+    );
+    $items['admin/config/rcc_rt_handler/set_rt_creds'] = array(
+        'title' => 'Manage RT Credentials',
+        'description' => 'Create and store an credentials for the RT system.',
+        'page callback' => 'drupal_get_form',
+        'page arguments' => array('rcc_rt_handler_set_creds_form', 1),
+        'access arguments' => array('administer site configuration'),
+    );
+    return $items;
+}
+
+/**
+ * Implements hook_form().
+ */
+function rcc_rt_handler_set_creds_form($form, &$form_state) {
+
+    $form['rt_host'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Host'),
+        '#default_value' => variable_get('rcc_rt_url'),
+        '#description' => t('https://some.domain.com'),
+        '#size' => 50,
+        '#maxlength' => 100,
+        '#required' => FALSE,
+    );
+
+    $form['rt_user'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Username'),
+        '#size' => 25,
+        '#maxlength' => 100,
+        '#required' => FALSE,
+    );
+
+
+    $form['rt_password'] = array(
+        '#type' => 'password',
+        '#title' => t('Password'),
+        '#size' => 25,
+        '#maxlength' => 100,
+        '#required' => FALSE,
+
+    );
+
+    $form['submit'] = array(
+        '#type' => 'submit',
+        '#value' => t('Submit'),
+    );
+
+    return $form;
+}
+
+/**
+ * Save configuration settings for module.
+ * Implements hook_node_submit()
+ */
+function rcc_rt_handler_set_creds_form_submit($form, &$form_state) {
+    if(!empty($form_state['values']['rt_user']) || !empty($form_state['values']['rt_password']) || !empty($form_state['values']['rt_host']) ) {
+        if(!empty($form_state['values']['rt_user']) ){
+            variable_set('rcc_rt_user', $form_state['values']['rt_user']);
+        }
+        if(!empty($form_state['values']['rt_password'])){
+            variable_set('rcc_rt_password', $form_state['values']['rt_password']);
+        }
+        if(!empty($form_state['values']['rt_host']) ){
+            variable_set('rcc_rt_url', $form_state['values']['rt_host']);
+        }
+        drupal_set_message(t('The credentials have been updated'));
+    } else {
+        form_set_error('title', t("Credentials could not be saved."));
+    }
+}
+
+/**
+ * Adds permission types for this module
+ * Implements hook_permission()
+ */
+function rcc_rt_handler_permission() {
+    return array(
+        'change rt credentials settings' => array(
+            'title' => t('Change RT credentials'),
+            'description' => t('Update REST credentials and host for RT service.'),
+        ),
+    );
+}
