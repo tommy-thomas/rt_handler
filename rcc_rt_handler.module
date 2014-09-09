@@ -292,7 +292,7 @@ function rcc_rt_handler_menu() {
     );
     $items['admin/config/rcc_rt_handler/set_rt_creds'] = array(
         'title' => 'Manage RT Credentials',
-        'description' => 'Create and store an credentials for the RT system.',
+        'description' => 'Create and store credentials for the RT system.',
         'page callback' => 'drupal_get_form',
         'page arguments' => array('rcc_rt_handler_set_creds_form', 1),
         'access arguments' => array('administer site configuration'),
